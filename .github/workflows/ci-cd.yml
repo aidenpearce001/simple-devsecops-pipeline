@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   # Job 0: Validate that PR is from develop to main
@@ -397,15 +398,18 @@ jobs:
         with:
           target: 'http://localhost:8000'
           rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a'
+          cmd_options: '-a -j -J report_json.json'
           fail_action: false
+          allow_issue_writing: false
 
-      - name: Upload ZAP report
+      - name: Upload ZAP reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
-          path: report_html.html
+          name: zap-reports
+          path: |
+            report_html.html
+            report_json.json
 
       - name: Comment PR with DAST results
         if: always()
@@ -416,25 +420,74 @@ jobs:
             
             let dastStatus = '✅ No security vulnerabilities found';
             let vulnerabilityDetails = '';
+            let alertsSummary = '';
             
             try {
-              // Check if ZAP report exists
-              if (fs.existsSync('report_html.html')) {
+              let alertCounts = { high: 0, medium: 0, low: 0, informational: 0 };
+              let alertDetails = [];
+              
+              // Try to read JSON report first (more accurate)
+              if (fs.existsSync('report_json.json')) {
+                const zapReport = JSON.parse(fs.readFileSync('report_json.json', 'utf8'));
+                
+                if (zapReport.site && zapReport.site[0] && zapReport.site[0].alerts) {
+                  const alerts = zapReport.site[0].alerts;
+                  
+                  alerts.forEach(alert => {
+                    const risk = alert.riskdesc ? alert.riskdesc.toLowerCase() : 'unknown';
+                    const name = alert.name || 'Unknown Alert';
+                    const count = alert.instances ? alert.instances.length : 1;
+                    
+                    if (risk.includes('high')) {
+                      alertCounts.high += count;
+                    } else if (risk.includes('medium')) {
+                      alertCounts.medium += count;
+                    } else if (risk.includes('low')) {
+                      alertCounts.low += count;
+                    } else {
+                      alertCounts.informational += count;
+                    }
+                    
+                    alertDetails.push(`• **${name}** (${risk}) - ${count} instance(s)`);
+                  });
+                }
+              } else if (fs.existsSync('report_html.html')) {
+                // Fallback to HTML parsing
                 const zapReport = fs.readFileSync('report_html.html', 'utf8');
                 
-                // Parse basic info from HTML report
-                const highAlerts = (zapReport.match(/High.*?(\d+)/g) || []).length;
-                const mediumAlerts = (zapReport.match(/Medium.*?(\d+)/g) || []).length;
-                const lowAlerts = (zapReport.match(/Low.*?(\d+)/g) || []).length;
+                // Basic parsing from HTML
+                const highMatches = zapReport.match(/FAIL-NEW:\s*(\d+)/);
+                const warnMatches = zapReport.match(/WARN-NEW:\s*(\d+)/);
+                const passMatches = zapReport.match(/PASS:\s*(\d+)/);
                 
-                if (highAlerts > 0 || mediumAlerts > 0) {
-                  dastStatus = '⚠️ Security vulnerabilities detected';
-                  vulnerabilityDetails = `\n🚨 **Vulnerabilities**: ${highAlerts} High, ${mediumAlerts} Medium, ${lowAlerts} Low`;
-                } else if (lowAlerts > 0) {
-                  dastStatus = '⚠️ Low-risk vulnerabilities detected';
-                  vulnerabilityDetails = `\n📝 **Info**: ${lowAlerts} Low-risk findings`;
+                if (highMatches) alertCounts.high = parseInt(highMatches[1]) || 0;
+                if (warnMatches) alertCounts.medium = parseInt(warnMatches[1]) || 0;
+                if (passMatches) {
+                  const passed = parseInt(passMatches[1]) || 0;
+                  alertsSummary = `\n✅ **Passed Checks**: ${passed}`;
                 }
               }
+              
+              const totalIssues = alertCounts.high + alertCounts.medium + alertCounts.low;
+              
+              if (alertCounts.high > 0) {
+                dastStatus = '🚨 High-risk security vulnerabilities detected';
+                vulnerabilityDetails = `\n**Vulnerabilities Found**: ${alertCounts.high} High, ${alertCounts.medium} Medium, ${alertCounts.low} Low`;
+              } else if (alertCounts.medium > 0) {
+                dastStatus = '⚠️ Medium-risk security issues detected';
+                vulnerabilityDetails = `\n**Issues Found**: ${alertCounts.medium} Medium, ${alertCounts.low} Low`;
+              } else if (alertCounts.low > 0) {
+                dastStatus = '📝 Low-risk security findings detected';
+                vulnerabilityDetails = `\n**Findings**: ${alertCounts.low} Low-risk`;
+              }
+              
+              // Add detailed alert information if available
+              if (alertDetails.length > 0 && alertDetails.length <= 10) {
+                vulnerabilityDetails += `\n\n**Alert Details**:\n${alertDetails.join('\n')}`;
+              } else if (alertDetails.length > 10) {
+                vulnerabilityDetails += `\n\n**Alert Details** (showing first 10 of ${alertDetails.length}):\n${alertDetails.slice(0, 10).join('\n')}`;
+              }
+              
             } catch (error) {
               dastStatus = '❌ DAST scan failed';
               console.log('Error reading ZAP report:', error);
@@ -442,14 +495,15 @@ jobs:
             
             const comment = `## 🔍 Dynamic Application Security Testing (ZAP)
             
-            ${dastStatus}${vulnerabilityDetails}
+            ${dastStatus}${vulnerabilityDetails}${alertsSummary}
             
-            **Target**: http://localhost:8000
-            **Job**: Dynamic Application Security Testing
-            **Workflow**: ${context.workflow}
+            **Target**: http://localhost:8000  
+            **Scan Type**: OWASP ZAP Baseline Scan  
+            **Job**: Dynamic Application Security Testing  
+            **Workflow**: ${context.workflow}  
             **Run**: ${context.runNumber}
             
-            ${vulnerabilityDetails ? '⚠️ Please review the detailed ZAP report in the workflow artifacts.' : ''}
+            ${vulnerabilityDetails ? '📋 **Full Report**: Check the ZAP reports in workflow artifacts for complete details.' : ''}
             `;
             
             github.rest.issues.createComment({
