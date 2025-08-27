@@ -63,10 +63,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install --system --locked
+          uv sync --frozen
 
       - name: Run pytest with coverage
         run: |
+          source .venv/bin/activate
           PYTHONPATH=. coverage run -m pytest -rap --junitxml coverage.xml || true
           coverage xml -i 
 
@@ -112,17 +113,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install uv and Safety
+      - name: Install uv and dependencies
         run: |
           pip install uv
+          uv sync --frozen
           uv pip install --system safety
 
       - name: Export requirements for Safety
         run: |
+          source .venv/bin/activate
           uv pip freeze > requirements-frozen.txt
 
       - name: Run Safety dependency check
         run: |
+          source .venv/bin/activate
           safety check -r requirements-frozen.txt
 
   # Job 5: Advanced coverage reporting
@@ -170,7 +174,7 @@ jobs:
 
   # Job 6: Build a Docker image and scan it with Trivy
   build-and-scan-docker:
-    needs: [run-bandit, run-safety] # This job depends on security scans passing
+    needs: [run-pytest, coverage, run-bandit, run-safety] # This job depends on tests and security scans passing
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -221,10 +225,11 @@ jobs:
       - name: Install uv and dependencies
         run: |
           pip install uv
-          uv pip install --system --locked
+          uv sync --frozen
 
       - name: Start FastAPI application in background
         run: |
+          source .venv/bin/activate
           PYTHONPATH=. uvicorn src.main:app --host 0.0.0.0 --port 8000 &
           echo "FastAPI_PID=$!" >> $GITHUB_ENV
         
