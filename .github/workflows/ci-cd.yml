@@ -353,10 +353,123 @@ jobs:
           # coverage summary in the PR comment.
           coverage-summary-title: "Code Coverage Summary"
 
-  # Job 6: Summary comment for overall results
+  # Job 6: DAST scan with OWASP ZAP
+  dast-zap:
+    name: Dynamic Application Security Testing
+    needs: [validate-pr, formatting-and-linting]
+    if: needs.validate-pr.outputs.is-valid == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv and dependencies
+        run: |
+          pip install uv
+          uv sync --frozen
+
+      - name: Start FastAPI application in background
+        run: |
+          source .venv/bin/activate
+          PYTHONPATH=. uvicorn src.main:app --host 0.0.0.0 --port 8000 &
+          echo "FastAPI_PID=$!" >> $GITHUB_ENV
+        
+      - name: Wait for application to start
+        run: |
+          echo "Waiting for FastAPI to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/ > /dev/null; then
+              echo "FastAPI is running!"
+              break
+            fi
+            echo "Attempt $i: FastAPI not ready yet, waiting..."
+            sleep 2
+          done
+          curl -f http://localhost:8000/ || (echo "FastAPI failed to start" && exit 1)
+
+      - name: Run OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:8000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+          fail_action: false
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
+
+      - name: Comment PR with DAST results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let dastStatus = '✅ No security vulnerabilities found';
+            let vulnerabilityDetails = '';
+            
+            try {
+              // Check if ZAP report exists
+              if (fs.existsSync('report_html.html')) {
+                const zapReport = fs.readFileSync('report_html.html', 'utf8');
+                
+                // Parse basic info from HTML report
+                const highAlerts = (zapReport.match(/High.*?(\d+)/g) || []).length;
+                const mediumAlerts = (zapReport.match(/Medium.*?(\d+)/g) || []).length;
+                const lowAlerts = (zapReport.match(/Low.*?(\d+)/g) || []).length;
+                
+                if (highAlerts > 0 || mediumAlerts > 0) {
+                  dastStatus = '⚠️ Security vulnerabilities detected';
+                  vulnerabilityDetails = `\n🚨 **Vulnerabilities**: ${highAlerts} High, ${mediumAlerts} Medium, ${lowAlerts} Low`;
+                } else if (lowAlerts > 0) {
+                  dastStatus = '⚠️ Low-risk vulnerabilities detected';
+                  vulnerabilityDetails = `\n📝 **Info**: ${lowAlerts} Low-risk findings`;
+                }
+              }
+            } catch (error) {
+              dastStatus = '❌ DAST scan failed';
+              console.log('Error reading ZAP report:', error);
+            }
+            
+            const comment = `## 🔍 Dynamic Application Security Testing (ZAP)
+            
+            ${dastStatus}${vulnerabilityDetails}
+            
+            **Target**: http://localhost:8000
+            **Job**: Dynamic Application Security Testing
+            **Workflow**: ${context.workflow}
+            **Run**: ${context.runNumber}
+            
+            ${vulnerabilityDetails ? '⚠️ Please review the detailed ZAP report in the workflow artifacts.' : ''}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Stop FastAPI application
+        if: always()
+        run: |
+          if [ ! -z "$FastAPI_PID" ]; then
+            kill $FastAPI_PID || true
+          fi
+
+  # Job 7: Summary comment for overall results
   pr-summary:
     if: always() && needs.validate-pr.outputs.is-valid == 'true'
-    needs: [validate-pr, formatting-and-linting, run-pytest, coverage, run-bandit, run-safety]
+    needs: [validate-pr, formatting-and-linting, run-pytest, coverage, run-bandit, run-safety, dast-zap]
     runs-on: ubuntu-latest
     steps:
       - name: Create PR summary comment
@@ -368,7 +481,8 @@ jobs:
               { name: 'Unit Tests', status: '${{ needs.run-pytest.result }}' },
               { name: 'Coverage Report', status: '${{ needs.coverage.result }}' },
               { name: 'Security Scan (Bandit)', status: '${{ needs.run-bandit.result }}' },
-              { name: 'Dependency Check (Safety)', status: '${{ needs.run-safety.result }}' }
+              { name: 'Dependency Check (Safety)', status: '${{ needs.run-safety.result }}' },
+              { name: 'DAST Security Scan (ZAP)', status: '${{ needs.dast-zap.result }}' }
             ];
             
             let overallStatus = '✅ All checks passed';
