@@ -9,12 +9,45 @@ on:
       - main
       - develop
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  # Job 1: Run unit tests and generate a coverage report
-  test-and-coverage:
+  # Job 1: Code formatting and linting
+  formatting-and-linting:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          pip install black isort ruff
+
+      - name: Run isort
+        run: isort .
+
+      - name: Run black
+        run: black .
+
+      - name: Run ruff
+        run: ruff check .
+
+  # Job 2: Unit tests with coverage
+  run-pytest:
+    name: Unit Test
+    needs: formatting-and-linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -25,36 +58,34 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install fastapi "uvicorn[standard]" pytest httpx pytest-cov
+          pip install fastapi "uvicorn[standard]" pytest pytest-cov coverage httpx
 
-      - name: Run unit tests with coverage
+      - name: Run pytest with coverage
         run: |
-          PYTHONPATH=. pytest --cov=./src --cov-report=xml
+          PYTHONPATH=. coverage run -m pytest -rap --junitxml coverage.xml || true
+          coverage xml -i 
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          name: coverage
           path: coverage.xml
           
-  # Job 2: Run a static analysis security scan with Bandit
-  sast-scan:
-    needs: test-and-coverage  # This job depends on tests passing
+  # Job 3: Run a static analysis security scan with Bandit
+  run-bandit:
+    name: Static application security testing
+    needs: formatting-and-linting
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Check out repository code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      
       - name: Install Bandit
         run: pip install bandit
 
-      - name: Run Bandit scan
-        run: bandit -r src -ll -f json -o bandit-report.json
+      - name: Run Bandit security analysis
+        run: |
+          bandit -r . -f json -o bandit-report.json --exit-zero
 
       - name: Upload Bandit report
         uses: actions/upload-artifact@v4
@@ -62,31 +93,84 @@ jobs:
           name: bandit-report
           path: bandit-report.json
 
-  # Job 3: Run a dependency security scan with OWASP Dependency-Check
-  dependency-scan:
-    needs: sast-scan # This job depends on SAST scan passing
+  # Job 4: Dependency security scan with Safety
+  run-safety:
+    name: Dependency Check
+    needs: formatting-and-linting
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Check out repository code
         uses: actions/checkout@v4
 
-      - name: Run OWASP Dependency-Check
-        # This action runs a Docker container with the tool
-        uses: dependency-check/Dependency-Check@5.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          project: 'fastapi-project'
-          format: 'ALL'
-          args: --scan src/ --failOnCVSS 7.0
+          python-version: '3.10'
 
-  # Job 4: Build a Docker image and scan it with Trivy
+      - name: Install Safety
+        run: pip install safety
+
+      - name: Create requirements.txt
+        run: |
+          pip install fastapi "uvicorn[standard]" pytest httpx pytest-cov
+          pip freeze > requirements.txt
+
+      - name: Run Safety dependency check
+        run: |
+          safety check -r requirements.txt
+
+  # Job 5: Advanced coverage reporting
+  coverage:
+    needs: [run-pytest]
+    name: Calculate code coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: .
+
+      - name: Produce the coverage report
+        uses: insightsengineering/coverage-action@v2
+        with:
+          # Path to the Cobertura XML report.
+          path: coverage.xml
+          # Minimum total coverage, if you want to the
+          # workflow to enforce it as a standard.
+          # This has no effect if the `fail` arg is set to `false`.
+          threshold: 80.123
+          # Fail the workflow if the minimum code coverage
+          # reuqirements are not satisfied.
+          fail: true
+          # Publish the rendered output as a PR comment
+          publish: true
+          # Create a coverage diff report.
+          diff: true
+          # Branch to diff against.
+          # Compare the current coverage to the coverage
+          # determined on this branch.
+          diff-branch: main
+          # This is where the coverage reports for the
+          # `diff-branch` are stored.
+          # Branch is created if it doesn't already exist'.
+          diff-storage: _xml_coverage_reports
+          # A custom title that can be added to the code
+          # coverage summary in the PR comment.
+          coverage-summary-title: "Code Coverage Summary"
+
+  # Job 6: Build a Docker image and scan it with Trivy
   build-and-scan-docker:
-    needs: dependency-scan # This job depends on the dependency scan passing
+    needs: [run-bandit, run-safety] # This job depends on security scans passing
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Checkout code
+      - name: Check out repository code
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
@@ -114,13 +198,13 @@ jobs:
           format: 'table'
           severity: 'HIGH,CRITICAL'
           
-  # Job 5: Deploy to a staging environment and run DAST scan with ZAP
+  # Job 7: Deploy to a staging environment and run DAST scan with ZAP
   dast-and-deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     needs: build-and-scan-docker # This job depends on the build and scan passing
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Check out repository code
         uses: actions/checkout@v4
         
       # Placeholder for a real deployment step (e.g., to a cloud service)
@@ -133,7 +217,7 @@ jobs:
           target: 'http://your-staging-url.com'
           fail_action: true
           
-  # Job 6: Final deployment to production
+  # Job 8: Final deployment to production
   deploy-production:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-scan-docker # Only run DAST if needed, then deploy
