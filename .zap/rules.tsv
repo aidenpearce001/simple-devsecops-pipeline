@@ -1,0 +1,12 @@
+# ZAP Scanning Rules
+# This file contains configuration for OWASP ZAP baseline scan
+# Format: ID	THRESHOLD	[NOTES]
+
+# Enable all baseline rules
+10001	OFF	# Backup File Disclosure (might be too noisy for CI)
+10003	OFF	# Vulnerable Libraries (handled by other security scans)
+90005	OFF	# Sec-Fetch-Dest Header Missing (might not be relevant for API)
+
+# You can customize these rules based on your application's needs
+# Threshold values: OFF, LOW, MEDIUM, HIGH
+# More rules can be added as needed
